@@ -1,0 +1,16 @@
+# Anchor / Cargo build artifacts
+target/
+.anchor/
+test-ledger/
+
+# Program keypair — pubkey is hardcoded in declare_id!() but the secret
+# stays out of git. Backup separately.
+programs/*/registry-keypair.json
+programs/*/*-keypair.json
+
+# editors / OS
+.DS_Store
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea
