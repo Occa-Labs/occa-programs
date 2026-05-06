@@ -4,22 +4,20 @@
 resolution = true
 skip-lint = false
 
-[programs.localnet]
-registry = "occakrum1PrVDaXauDuSiwPKfrhdnm7uVWKJxE39kfm"
-
 [programs.devnet]
-registry = "occakrum1PrVDaXauDuSiwPKfrhdnm7uVWKJxE39kfm"
+registry = "occaTHMv5eYG5aZ85jimxTvHkBfsDCvndXC6J2k8kxr"
 
-[registry]
-url = "https://api.apr.dev"
+[programs.localnet]
+registry = "occa53sXCgBPvd2omBH47626V6jyJ28ove5xNX8uEtN"
 
 [provider]
-cluster = "Devnet"
+cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [workspace]
 members = ["programs/registry"]
 
 [scripts]
-# No JS-based tests yet; we'll add bankrun/integration tests in CP3.
 test = "echo 'no tests yet'"
+
+[hooks]

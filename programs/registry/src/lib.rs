@@ -33,7 +33,7 @@
 
 use anchor_lang::prelude::*;
 
-declare_id!("occakrum1PrVDaXauDuSiwPKfrhdnm7uVWKJxE39kfm");
+declare_id!("occaTHMv5eYG5aZ85jimxTvHkBfsDCvndXC6J2k8kxr");
 
 // ─── Bounds ────────────────────────────────────────────────────────────────
 pub const MAX_NAME_LEN: usize = 64;
