@@ -8,6 +8,12 @@ test-ledger/
 programs/*/registry-keypair.json
 programs/*/*-keypair.json
 
+# node / ts deps
+node_modules/
+dist/
+package-lock.json
+yarn.lock
+
 # editors / OS
 .DS_Store
 .vscode/*

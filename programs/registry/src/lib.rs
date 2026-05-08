@@ -32,6 +32,10 @@
 // "Chain = truth, DB = cache".
 
 use anchor_lang::prelude::*;
+use treasury::{
+    cpi::accounts::InitTreasury as CpiInitTreasury, program::Treasury, OperationsAccount,
+    OperationsKind,
+};
 
 declare_id!("occaTHMv5eYG5aZ85jimxTvHkBfsDCvndXC6J2k8kxr");
 
@@ -45,7 +49,12 @@ pub const MAX_REPUTATION_URI_LEN: usize = 200;
 // ─── Account schema versions (bump on field changes) ───────────────────────
 pub const COMPANY_ACCOUNT_VERSION: u8 = 3;
 pub const AGENT_IDENTITY_ACCOUNT_VERSION: u8 = 1;
-pub const DEPLOYMENT_ACCOUNT_VERSION: u8 = 1;
+pub const DEPLOYMENT_ACCOUNT_VERSION: u8 = 2;
+pub const DAILY_ANCHOR_ACCOUNT_VERSION: u8 = 1;
+
+// Seconds in a calendar day (UTC). Used to validate `day_unix` aligns to
+// 00:00:00 in `commit_daily_anchor`.
+pub const SECONDS_PER_DAY: i64 = 86_400;
 
 // ─── Status encodings ──────────────────────────────────────────────────────
 // CompanyAccount.status
@@ -63,7 +72,10 @@ pub mod registry {
 
     // ───────────────────────────── Company ─────────────────────────────────
 
-    /// Create a new CompanyAccount PDA.
+    /// Create a new CompanyAccount PDA + atomically initialize its
+    /// TreasuryAccount + PolicyAccount via CPI to the treasury program.
+    /// Per design §6: company creation never leaves a window where treasury
+    /// pointers are unset; any failure rolls back the entire transaction.
     ///
     /// Seeds: `["company", owner, nonce_le_u32]`
     pub fn create_company(
@@ -83,22 +95,41 @@ pub mod registry {
         );
 
         let now = Clock::get()?.unix_timestamp;
-        let company = &mut ctx.accounts.company;
-        company.version = COMPANY_ACCOUNT_VERSION;
-        company.owner = ctx.accounts.owner.key();
-        // Treasury / Policy programs are deployed in a later phase. We
-        // pin Pubkey::default() here so clients can detect "not yet
-        // wired" via `treasury == Pubkey::default()`.
-        company.treasury = Pubkey::default();
-        company.policy = Pubkey::default();
-        company.created_at = now;
-        company.updated_at = now;
-        company.nonce = nonce;
-        company.status = COMPANY_STATUS_ACTIVE;
-        company.name = name;
-        company.locale = locale;
-        company.metadata_uri = metadata_uri;
-        company.metadata_hash = metadata_hash;
+        let treasury_pda = ctx.accounts.treasury.key();
+        let policy_pda = ctx.accounts.policy.key();
+        {
+            let company = &mut ctx.accounts.company;
+            company.version = COMPANY_ACCOUNT_VERSION;
+            company.owner = ctx.accounts.owner.key();
+            company.treasury = treasury_pda;
+            company.policy = policy_pda;
+            company.created_at = now;
+            company.updated_at = now;
+            company.nonce = nonce;
+            company.status = COMPANY_STATUS_ACTIVE;
+            company.name = name;
+            company.locale = locale;
+            company.metadata_uri = metadata_uri;
+            company.metadata_hash = metadata_hash;
+        }
+
+        // CPI into treasury::init_treasury — atomic with company creation.
+        // If this fails, the whole tx rolls back including the CompanyAccount
+        // init above. Treasury verifies `company` is owned by Registry via
+        // its own `owner = REGISTRY_PROGRAM_ID` constraint; PDA seeds for
+        // treasury+policy ensure 1:1 mapping with this company.
+        let cpi_accounts = CpiInitTreasury {
+            company: ctx.accounts.company.to_account_info(),
+            treasury: ctx.accounts.treasury.to_account_info(),
+            policy: ctx.accounts.policy.to_account_info(),
+            payer: ctx.accounts.payer.to_account_info(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+        };
+        treasury::cpi::init_treasury(CpiContext::new(
+            ctx.accounts.treasury_program.key(),
+            cpi_accounts,
+        ))?;
+
         Ok(())
     }
 
@@ -249,7 +280,7 @@ pub mod registry {
         deployment.company = company.key();
         deployment.deployment_index = deployment_index;
         deployment.owner = company.owner;
-        deployment.operating_wallet = Pubkey::default();
+        deployment.receiving_address = Pubkey::default();
         deployment.adapter_id = adapter_id;
         deployment.role = role;
         deployment.parent_deployment_index = parent_deployment_index;
@@ -326,19 +357,103 @@ pub mod registry {
         Ok(())
     }
 
-    /// Set or replace the deployment's operating wallet. Pass
-    /// `Pubkey::default()` to clear. Owner-only.
-    pub fn set_operating_wallet(
-        ctx: Context<SetOperatingWallet>,
-        new_operating_wallet: Pubkey,
+    /// Set or replace the deployment's receiving address — the passive
+    /// destination wallet that funds disbursed *to* this agent land in.
+    /// Pass `Pubkey::default()` to clear. Owner-only. NEVER a signer:
+    /// this address does not authorize on-chain actions, it only receives.
+    pub fn set_receiving_address(
+        ctx: Context<SetReceivingAddress>,
+        new_receiving_address: Pubkey,
     ) -> Result<()> {
         let deployment = &mut ctx.accounts.deployment;
         require!(
             deployment.status != DEPLOYMENT_STATUS_RETIRED,
             RegistryError::DeploymentRetired
         );
-        deployment.operating_wallet = new_operating_wallet;
+        deployment.receiving_address = new_receiving_address;
         deployment.updated_at = Clock::get()?.unix_timestamp;
+        Ok(())
+    }
+
+    // ───────────────────────── Daily Anchor (§2 trace) ─────────────────────
+
+    /// Commit a daily Merkle root anchor for a deployment's task hashes.
+    ///
+    /// Per Whitepaper §2 trace architecture: per-task records live off-chain
+    /// in OCCA's database; this anchor proves OCCA didn't tamper with that
+    /// day's task list. Anyone can re-hash off-chain records and verify
+    /// against `merkle_root`.
+    ///
+    /// Seeds: `["daily_anchor", deployment_pda, day_unix_le_i64]`.
+    /// PDA collision = at most one anchor per (deployment, day). Re-attempts
+    /// on the same key fail naturally (Anchor `init` rejects).
+    ///
+    /// Authorization: signed by the Anchor Wallet registered as
+    /// `OperationsAccount[Anchor]` in the treasury program. The signer
+    /// pubkey must equal `operations.signer`; this ix's discriminator must
+    /// be in `operations.action_whitelist`. The OperationsAccount is
+    /// resolved via cross-program PDA lookup (`seeds::program = treasury::ID`).
+    ///
+    /// Phase 1 rate limit: NOT enforced. Registry cannot mutate the
+    /// treasury-owned OperationsAccount's `signatures_this_period` counter
+    /// without an extra CPI. PDA collision (one per deployment+day) provides
+    /// natural deduplication; rent burn (~0.002 SOL each) caps griefing.
+    /// If a stronger rate limit becomes necessary, add a treasury CPI ix
+    /// `tick_anchor_signature` and wire it here.
+    pub fn commit_daily_anchor(
+        ctx: Context<CommitDailyAnchor>,
+        day_unix: i64,
+        merkle_root: [u8; 32],
+        task_count: u32,
+    ) -> Result<()> {
+        require!(task_count > 0, RegistryError::EmptyAnchor);
+        require!(
+            day_unix > 0 && day_unix % SECONDS_PER_DAY == 0,
+            RegistryError::InvalidDayBoundary
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        require!(day_unix <= now, RegistryError::FutureAnchor);
+
+        // Active-deployment requirement (§2 "per active agent").
+        let deployment = &ctx.accounts.deployment;
+        require!(
+            deployment.status == DEPLOYMENT_STATUS_ACTIVE,
+            RegistryError::DeploymentNotActive
+        );
+        require!(
+            deployment.company == ctx.accounts.company.key(),
+            RegistryError::CompanyMismatch
+        );
+
+        // Operations state (read-only).
+        let ops = &ctx.accounts.operations;
+        require!(!ops.revoked, RegistryError::OperationsRevoked);
+        if ops.expiry_unix != 0 {
+            require!(now < ops.expiry_unix, RegistryError::OperationsExpired);
+        }
+
+        // Whitelist check — this ix's own discriminator must be allowed.
+        let disc_slice: &[u8] = crate::instruction::CommitDailyAnchor::DISCRIMINATOR;
+        let disc_arr: [u8; 8] = disc_slice
+            .try_into()
+            .map_err(|_| error!(RegistryError::InvalidDiscriminator))?;
+        require!(
+            ops.action_whitelist.iter().any(|d| *d == disc_arr),
+            RegistryError::DiscriminatorNotWhitelisted
+        );
+
+        let anchor_acc = &mut ctx.accounts.daily_anchor;
+        anchor_acc.version = DAILY_ANCHOR_ACCOUNT_VERSION;
+        anchor_acc.deployment = deployment.key();
+        anchor_acc.company = ctx.accounts.company.key();
+        anchor_acc.day_unix = day_unix;
+        anchor_acc.merkle_root = merkle_root;
+        anchor_acc.task_count = task_count;
+        anchor_acc.committed_at = now;
+        anchor_acc.committed_by = ctx.accounts.anchor_signer.key();
+        anchor_acc.bump = ctx.bumps.daily_anchor;
+
         Ok(())
     }
 }
@@ -360,9 +475,23 @@ pub struct CreateCompany<'info> {
     /// Owning user wallet — signer to prevent PDA squatting.
     pub owner: Signer<'info>,
 
-    /// Pays rent. Typically the operator hot wallet (sponsored UX).
+    /// Pays rent for company + treasury + policy PDAs.
     #[account(mut)]
     pub payer: Signer<'info>,
+
+    /// TreasuryAccount PDA — created by `treasury::init_treasury` CPI in
+    /// the handler. Seed/owner verification happens inside that program.
+    /// CHECK: address + ownership verified by treasury program via init.
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+
+    /// PolicyAccount PDA — created by `treasury::init_treasury` CPI.
+    /// CHECK: address + ownership verified by treasury program via init.
+    #[account(mut)]
+    pub policy: UncheckedAccount<'info>,
+
+    /// Treasury program — invoked via CPI to atomically init treasury+policy.
+    pub treasury_program: Program<'info, Treasury>,
 
     pub system_program: Program<'info, System>,
 }
@@ -479,13 +608,57 @@ pub struct RetireDeployment<'info> {
 }
 
 #[derive(Accounts)]
-pub struct SetOperatingWallet<'info> {
+pub struct SetReceivingAddress<'info> {
     #[account(
         mut,
         has_one = owner @ RegistryError::Unauthorized,
     )]
     pub deployment: Account<'info, Deployment>,
     pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(day_unix: i64)]
+pub struct CommitDailyAnchor<'info> {
+    /// Deployment whose task stream this anchor covers.
+    pub deployment: Account<'info, Deployment>,
+
+    /// CompanyAccount referenced by deployment. Verified via
+    /// `deployment.company == company.key()` constraint in handler so we
+    /// can also resolve the OperationsAccount[Anchor] PDA.
+    /// CHECK: matched against `deployment.company` in handler.
+    pub company: UncheckedAccount<'info>,
+
+    /// Anchor Wallet — pubkey verified against `operations.signer`.
+    pub anchor_signer: Signer<'info>,
+
+    /// `OperationsAccount[Anchor]` from treasury program. Resolved via
+    /// cross-program PDA derivation. Anchor `Account<T>` auto-verifies
+    /// owner = treasury::ID via `OperationsAccount`'s `Owner` impl.
+    #[account(
+        seeds = [b"operations", company.key().as_ref(), &[OperationsKind::Anchor.as_byte()]],
+        bump = operations.bump,
+        seeds::program = treasury::ID,
+        constraint = operations.kind == OperationsKind::Anchor @ RegistryError::WrongOperationsKind,
+        constraint = operations.signer == anchor_signer.key() @ RegistryError::Unauthorized,
+        constraint = operations.company == company.key() @ RegistryError::CompanyMismatch,
+    )]
+    pub operations: Account<'info, OperationsAccount>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + DailyAnchorAccount::INIT_SPACE,
+        seeds = [b"daily_anchor", deployment.key().as_ref(), &day_unix.to_le_bytes()],
+        bump,
+    )]
+    pub daily_anchor: Account<'info, DailyAnchorAccount>,
+
+    /// Pays rent for the DailyAnchorAccount PDA.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 // ─── Account schemas ───────────────────────────────────────────────────────
@@ -563,9 +736,13 @@ pub struct Deployment {
     pub deployment_index: u32,
     /// Mirror of `company.owner` for fast single-account auth checks.
     pub owner: Pubkey,
-    /// Externally-provided wallet for agent-side transactions.
-    /// Pubkey::default() = unset.
-    pub operating_wallet: Pubkey,
+    /// Passive destination wallet for funds disbursed *to* this agent
+    /// (Agent Receiving Address per Whitepaper §8.2 v0.10). NOT a signer
+    /// — never authorizes on-chain actions. Treasury disburse instructions
+    /// match against this field to identify intra-company transfers and
+    /// deduct the Agent Operating Fee. `Pubkey::default()` = unset
+    /// (disbursements to this deployment will fail until set).
+    pub receiving_address: Pubkey,
     /// Pinned adapter (Pubkey::default() = unspecified).
     pub adapter_id: Pubkey,
     /// Capability persona / function tag (e.g. "ceo", "sdr"). NOT a
@@ -587,6 +764,33 @@ pub struct Deployment {
     pub metadata_uri: String,
     /// SHA-256 of metadata JSON.
     pub metadata_hash: [u8; 32],
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct DailyAnchorAccount {
+    /// Schema version.
+    pub version: u8,
+    /// Deployment whose task stream this anchor covers.
+    pub deployment: Pubkey,
+    /// CompanyAccount the deployment belongs to (denormalized for fast
+    /// indexing — avoids a deployment-account fetch on read).
+    pub company: Pubkey,
+    /// Unix timestamp of 00:00:00 UTC for the day this anchor covers.
+    /// Aligned by `day_unix % 86_400 == 0` constraint at commit time.
+    pub day_unix: i64,
+    /// Merkle root over that day's task hashes (off-chain DB).
+    pub merkle_root: [u8; 32],
+    /// Number of leaves (tasks) in the Merkle tree. Must be > 0 — empty
+    /// days produce no anchor (§2).
+    pub task_count: u32,
+    /// Unix timestamp when this commit landed on-chain.
+    pub committed_at: i64,
+    /// Anchor Wallet pubkey that signed the commit. Mirror of
+    /// `OperationsAccount[Anchor].signer` at commit time.
+    pub committed_by: Pubkey,
+    /// Bump for PDA verification.
+    pub bump: u8,
 }
 
 // ─── Errors ────────────────────────────────────────────────────────────────
@@ -613,4 +817,24 @@ pub enum RegistryError {
     DeploymentRetired,
     #[msg("identity owner does not match company owner")]
     IdentityOwnerMismatch,
+    #[msg("daily anchor must cover at least one task")]
+    EmptyAnchor,
+    #[msg("day_unix must be > 0 and aligned to 00:00:00 UTC (multiple of 86400)")]
+    InvalidDayBoundary,
+    #[msg("daily anchor cannot be for a future day")]
+    FutureAnchor,
+    #[msg("deployment must be active to commit anchor")]
+    DeploymentNotActive,
+    #[msg("deployment.company does not match passed company account")]
+    CompanyMismatch,
+    #[msg("operations account is revoked")]
+    OperationsRevoked,
+    #[msg("operations account is past its expiry")]
+    OperationsExpired,
+    #[msg("operations account kind does not match instruction expectation")]
+    WrongOperationsKind,
+    #[msg("instruction discriminator is not whitelisted on operations account")]
+    DiscriminatorNotWhitelisted,
+    #[msg("could not parse instruction discriminator")]
+    InvalidDiscriminator,
 }

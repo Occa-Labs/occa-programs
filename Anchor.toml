@@ -6,16 +6,18 @@ skip-lint = false
 
 [programs.devnet]
 registry = "occaTHMv5eYG5aZ85jimxTvHkBfsDCvndXC6J2k8kxr"
+treasury = "occaxyVLnurdjedWCBPrvDCCto8wGYadtTZ3nAmcVzh"
 
 [programs.localnet]
 registry = "occa53sXCgBPvd2omBH47626V6jyJ28ove5xNX8uEtN"
+treasury = "occaxyVLnurdjedWCBPrvDCCto8wGYadtTZ3nAmcVzh"
 
 [provider]
 cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [workspace]
-members = ["programs/registry"]
+members = ["programs/registry", "programs/treasury"]
 
 [scripts]
 test = "echo 'no tests yet'"

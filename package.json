@@ -1,0 +1,19 @@
+{
+  "name": "occa-programs-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Smoke tests + bootstrap scripts for OCCA registry + treasury programs",
+  "scripts": {
+    "bootstrap": "ts-node tests/bootstrap.ts",
+    "smoke": "ts-node tests/smoke.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.0",
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.4.0"
+  }
+}
