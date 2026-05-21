@@ -7,7 +7,8 @@
     "bootstrap": "ts-node tests/bootstrap.ts",
     "smoke": "ts-node tests/smoke.ts",
     "disburse-routine": "ts-node tests/disburse-routine.ts",
-    "disburse-routine-fails": "ts-node tests/disburse-routine-fails.ts"
+    "disburse-routine-fails": "ts-node tests/disburse-routine-fails.ts",
+    "disburse-privileged": "ts-node tests/disburse-privileged.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.0",
