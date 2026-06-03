@@ -283,10 +283,10 @@ pub mod registry {
 
         let company = &ctx.accounts.company;
         let identity = &ctx.accounts.identity;
-        require!(
-            identity.owner == company.owner,
-            RegistryError::IdentityOwnerMismatch
-        );
+        // Cross-owner deployments are allowed (the marketplace): the agent
+        // owner signs (consent), the company is referenced. Same-owner
+        // deployments still work — the signer is both. Two-sided consent
+        // (the company's invite) is enforced off-chain before this runs.
 
         let now = Clock::get()?.unix_timestamp;
         let deployment = &mut ctx.accounts.deployment;
@@ -578,16 +578,20 @@ pub struct SetAgentReceivingAddress<'info> {
 #[derive(Accounts)]
 #[instruction(deployment_index: u32)]
 pub struct CreateDeployment<'info> {
+    /// Company the agent is being deployed into. Referenced only — the
+    /// company owner's consent to the hire is captured off-chain (the
+    /// invite), so the company owner is NOT a required signer here.
+    pub company: Account<'info, CompanyAccount>,
+
+    /// AgentIdentity being deployed. The IDENTITY owner signs — deploying
+    /// an agent (incl. into another owner's company, the marketplace case)
+    /// is authorized by the agent's owner accepting.
     #[account(
         has_one = owner @ RegistryError::Unauthorized,
     )]
-    pub company: Account<'info, CompanyAccount>,
-
-    /// AgentIdentity to deploy. Phase 1: must be owned by the same
-    /// wallet as the company (enforced in handler).
     pub identity: Account<'info, AgentIdentity>,
 
-    /// Company owner (signer). Authority for state changes.
+    /// Agent owner (signer) — authorizes deploying THEIR agent.
     pub owner: Signer<'info>,
 
     #[account(
