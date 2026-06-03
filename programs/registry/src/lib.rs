@@ -48,7 +48,7 @@ pub const MAX_REPUTATION_URI_LEN: usize = 200;
 
 // ─── Account schema versions (bump on field changes) ───────────────────────
 pub const COMPANY_ACCOUNT_VERSION: u8 = 3;
-pub const AGENT_IDENTITY_ACCOUNT_VERSION: u8 = 1;
+pub const AGENT_IDENTITY_ACCOUNT_VERSION: u8 = 2;
 pub const DEPLOYMENT_ACCOUNT_VERSION: u8 = 2;
 pub const DAILY_ANCHOR_ACCOUNT_VERSION: u8 = 1;
 
@@ -204,6 +204,7 @@ pub mod registry {
         identity.version = AGENT_IDENTITY_ACCOUNT_VERSION;
         identity.agent_pubkey = agent_pubkey;
         identity.owner = ctx.accounts.owner.key();
+        identity.receiving_address = Pubkey::default();
         identity.created_at = now;
         identity.updated_at = now;
         identity.name = name;
@@ -233,6 +234,20 @@ pub mod registry {
         identity.name = name;
         identity.metadata_uri = metadata_uri;
         identity.metadata_hash = metadata_hash;
+        identity.updated_at = Clock::get()?.unix_timestamp;
+        Ok(())
+    }
+
+    /// Set or replace the agent's PERSONAL receiving wallet — the passive
+    /// destination for funds disbursed to this agent, intrinsic to the
+    /// identity (no company/deployment required). Pass `Pubkey::default()`
+    /// to clear. Identity-owner only. NEVER a signer — it only receives.
+    pub fn set_agent_receiving_address(
+        ctx: Context<SetAgentReceivingAddress>,
+        new_receiving_address: Pubkey,
+    ) -> Result<()> {
+        let identity = &mut ctx.accounts.identity;
+        identity.receiving_address = new_receiving_address;
         identity.updated_at = Clock::get()?.unix_timestamp;
         Ok(())
     }
@@ -280,7 +295,10 @@ pub mod registry {
         deployment.company = company.key();
         deployment.deployment_index = deployment_index;
         deployment.owner = company.owner;
-        deployment.receiving_address = Pubkey::default();
+        // Default to the agent's personal receiving wallet (intrinsic to
+        // the identity). Owner can still override per-deployment via
+        // set_receiving_address.
+        deployment.receiving_address = identity.receiving_address;
         deployment.adapter_id = adapter_id;
         deployment.role = role;
         deployment.parent_deployment_index = parent_deployment_index;
@@ -548,6 +566,16 @@ pub struct UpdateAgentIdentityMetadata<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetAgentReceivingAddress<'info> {
+    #[account(
+        mut,
+        has_one = owner @ RegistryError::Unauthorized,
+    )]
+    pub identity: Account<'info, AgentIdentity>,
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
 #[instruction(deployment_index: u32)]
 pub struct CreateDeployment<'info> {
     #[account(
@@ -705,6 +733,13 @@ pub struct AgentIdentity {
     pub agent_pubkey: Pubkey,
     /// Owning user wallet. Immutable — set at mint and never changes.
     pub owner: Pubkey,
+    /// The agent's PERSONAL receiving wallet — a passive destination for
+    /// funds disbursed to this agent, intrinsic to the identity (like a
+    /// person's bank account). Owner-set anytime via
+    /// `set_agent_receiving_address`, independent of any company/deployment.
+    /// At `create_deployment` the deployment's `receiving_address` defaults
+    /// to this. `Pubkey::default()` = unset. NEVER a signer.
+    pub receiving_address: Pubkey,
     /// Unix timestamp at mint.
     pub created_at: i64,
     /// Unix timestamp of last state mutation.
