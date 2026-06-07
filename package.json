@@ -6,9 +6,12 @@
   "scripts": {
     "bootstrap": "ts-node tests/bootstrap.ts",
     "smoke": "ts-node tests/smoke.ts",
+    "commit-trace": "ts-node tests/commit-trace.ts",
+    "read-reputation": "ts-node tests/read-reputation.ts",
     "disburse-routine": "ts-node tests/disburse-routine.ts",
     "disburse-routine-fails": "ts-node tests/disburse-routine-fails.ts",
-    "disburse-privileged": "ts-node tests/disburse-privileged.ts"
+    "disburse-privileged": "ts-node tests/disburse-privileged.ts",
+    "anchor-task": "ts-node tests/anchor-existing-task.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.0",

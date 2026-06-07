@@ -45,12 +45,19 @@ pub const MAX_LOCALE_LEN: usize = 8;
 pub const MAX_ROLE_LEN: usize = 32;
 pub const MAX_METADATA_URI_LEN: usize = 200;
 pub const MAX_REPUTATION_URI_LEN: usize = 200;
+pub const MAX_RESULT_URI_LEN: usize = 200;
+
+/// Quality score is a 0-100 rubric output (see the off-chain news-writing
+/// rubric). `rubric_version` is anchored alongside so scores stay
+/// comparable only within the same rubric version.
+pub const MAX_QUALITY_SCORE: u8 = 100;
 
 // ─── Account schema versions (bump on field changes) ───────────────────────
 pub const COMPANY_ACCOUNT_VERSION: u8 = 3;
 pub const AGENT_IDENTITY_ACCOUNT_VERSION: u8 = 2;
 pub const DEPLOYMENT_ACCOUNT_VERSION: u8 = 2;
 pub const DAILY_ANCHOR_ACCOUNT_VERSION: u8 = 1;
+pub const TRACE_ANCHOR_ACCOUNT_VERSION: u8 = 1;
 
 // Seconds in a calendar day (UTC). Used to validate `day_unix` aligns to
 // 00:00:00 in `commit_daily_anchor`.
@@ -65,6 +72,11 @@ pub const COMPANY_STATUS_PAUSED: u8 = 1;
 pub const DEPLOYMENT_STATUS_ACTIVE: u8 = 0;
 pub const DEPLOYMENT_STATUS_PAUSED: u8 = 1;
 pub const DEPLOYMENT_STATUS_RETIRED: u8 = 2;
+
+// TraceAnchorAccount.verdict — only Passed deliverables are ever anchored
+// (policy: keep unverified/spam output off-chain). Stored as u8 so future
+// verdicts could be added without an account layout change.
+pub const TRACE_VERDICT_PASSED: u8 = 1;
 
 #[program]
 pub mod registry {
@@ -474,6 +486,112 @@ pub mod registry {
 
         Ok(())
     }
+
+    /// Anchor a single completed, verified deliverable on-chain — per-task
+    /// provenance. Where `commit_daily_anchor` commits one Merkle root over
+    /// a day's task stream, this records ONE deliverable: a link to the
+    /// result, the content hash that locks it, and the verification verdict
+    /// + quality score.
+    ///
+    /// Only deliverables that PASSED the off-chain verification gate are
+    /// anchored (policy: keep unverified / spam output off the chain).
+    /// `verdict` is therefore always written `TRACE_VERDICT_PASSED`; failed
+    /// work is simply never committed through this ix.
+    ///
+    /// Per Whitepaper §2 trace architecture: the deliverable itself stays
+    /// off-chain. `content_hash` makes the result tamper-evident and
+    /// `evidence_hash` locks the off-chain verification report. Anyone can
+    /// re-hash the artifact + report and verify against these. The on-chain
+    /// `quality_score` + `rubric_version` make the quality signal itself
+    /// tamper-evident — the agent cannot self-assert it.
+    ///
+    /// Seeds: `["trace", task_id]`. PDA collision = at most one anchor per
+    /// task. Re-attempts on the same `task_id` fail naturally (Anchor `init`
+    /// rejects).
+    ///
+    /// Authorization: identical model to `commit_daily_anchor` — signed by
+    /// the Anchor Wallet registered as `OperationsAccount[Anchor]`; this
+    /// ix's discriminator must be whitelisted on that account. Resolved via
+    /// cross-program PDA lookup (`seeds::program = treasury::ID`).
+    ///
+    /// Phase 1 rate limit: NOT enforced (same constraint as
+    /// `commit_daily_anchor` — registry cannot mutate the treasury-owned
+    /// ops counter without an extra CPI). PDA-per-task dedup + rent burn
+    /// cap griefing.
+    pub fn commit_trace(
+        ctx: Context<CommitTrace>,
+        task_id: [u8; 32],
+        result_uri: String,
+        content_hash: [u8; 32],
+        quality_score: u8,
+        rubric_version: u8,
+        evidence_hash: [u8; 32],
+        completed_at: i64,
+    ) -> Result<()> {
+        require!(
+            result_uri.len() <= MAX_RESULT_URI_LEN,
+            RegistryError::ResultUriTooLong
+        );
+        require!(
+            quality_score <= MAX_QUALITY_SCORE,
+            RegistryError::InvalidQualityScore
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            completed_at > 0 && completed_at <= now,
+            RegistryError::InvalidCompletedAt
+        );
+
+        // Deployment must be active and belong to the passed company.
+        let deployment = &ctx.accounts.deployment;
+        require!(
+            deployment.status == DEPLOYMENT_STATUS_ACTIVE,
+            RegistryError::DeploymentNotActive
+        );
+        require!(
+            deployment.company == ctx.accounts.company.key(),
+            RegistryError::CompanyMismatch
+        );
+
+        // Operations state (read-only).
+        let ops = &ctx.accounts.operations;
+        require!(!ops.revoked, RegistryError::OperationsRevoked);
+        if ops.expiry_unix != 0 {
+            require!(now < ops.expiry_unix, RegistryError::OperationsExpired);
+        }
+
+        // Whitelist check — this ix's own discriminator must be allowed.
+        let disc_slice: &[u8] = crate::instruction::CommitTrace::DISCRIMINATOR;
+        let disc_arr: [u8; 8] = disc_slice
+            .try_into()
+            .map_err(|_| error!(RegistryError::InvalidDiscriminator))?;
+        require!(
+            ops.action_whitelist.iter().any(|d| *d == disc_arr),
+            RegistryError::DiscriminatorNotWhitelisted
+        );
+
+        let trace = &mut ctx.accounts.trace_anchor;
+        trace.version = TRACE_ANCHOR_ACCOUNT_VERSION;
+        trace.task_id = task_id;
+        trace.company = ctx.accounts.company.key();
+        // Reputation aggregates per stable AgentIdentity (survives
+        // redeployments), so anchor the identity, not just the deployment.
+        trace.agent = deployment.agent_identity;
+        trace.deployment = deployment.key();
+        trace.result_uri = result_uri;
+        trace.content_hash = content_hash;
+        trace.verdict = TRACE_VERDICT_PASSED;
+        trace.quality_score = quality_score;
+        trace.rubric_version = rubric_version;
+        trace.evidence_hash = evidence_hash;
+        trace.completed_at = completed_at;
+        trace.committed_at = now;
+        trace.committed_by = ctx.accounts.anchor_signer.key();
+        trace.bump = ctx.bumps.trace_anchor;
+
+        Ok(())
+    }
 }
 
 // ─── Account contexts ──────────────────────────────────────────────────────
@@ -693,6 +811,50 @@ pub struct CommitDailyAnchor<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+#[instruction(task_id: [u8; 32])]
+pub struct CommitTrace<'info> {
+    /// Deployment that produced this deliverable.
+    pub deployment: Account<'info, Deployment>,
+
+    /// CompanyAccount referenced by deployment. Verified via
+    /// `deployment.company == company.key()` in the handler so we can also
+    /// resolve the OperationsAccount[Anchor] PDA from it.
+    /// CHECK: matched against `deployment.company` in handler.
+    pub company: UncheckedAccount<'info>,
+
+    /// Anchor Wallet — pubkey verified against `operations.signer`.
+    pub anchor_signer: Signer<'info>,
+
+    /// `OperationsAccount[Anchor]` from treasury program. Resolved via
+    /// cross-program PDA derivation; Anchor `Account<T>` auto-verifies
+    /// owner = treasury::ID.
+    #[account(
+        seeds = [b"operations", company.key().as_ref(), &[OperationsKind::Anchor.as_byte()]],
+        bump = operations.bump,
+        seeds::program = treasury::ID,
+        constraint = operations.kind == OperationsKind::Anchor @ RegistryError::WrongOperationsKind,
+        constraint = operations.signer == anchor_signer.key() @ RegistryError::Unauthorized,
+        constraint = operations.company == company.key() @ RegistryError::CompanyMismatch,
+    )]
+    pub operations: Account<'info, OperationsAccount>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + TraceAnchorAccount::INIT_SPACE,
+        seeds = [b"trace", task_id.as_ref()],
+        bump,
+    )]
+    pub trace_anchor: Account<'info, TraceAnchorAccount>,
+
+    /// Pays rent for the TraceAnchorAccount PDA.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 // ─── Account schemas ───────────────────────────────────────────────────────
 
 #[account]
@@ -832,6 +994,56 @@ pub struct DailyAnchorAccount {
     pub bump: u8,
 }
 
+/// Per-deliverable provenance record. One per completed, verified task.
+/// The deliverable content lives off-chain; this account locks its
+/// identity, content hash, and verified quality so it is tamper-evident
+/// and attributable. Reputation views are derived off-chain by folding
+/// over these accounts per `agent`.
+#[account]
+#[derive(InitSpace)]
+pub struct TraceAnchorAccount {
+    /// Schema version.
+    pub version: u8,
+    /// Hash of task creation params — globally unique task id, also baked
+    /// into the PDA seed.
+    pub task_id: [u8; 32],
+    /// CompanyAccount the work was produced in (denormalized for indexing).
+    pub company: Pubkey,
+    /// AgentIdentity PDA that produced the deliverable. Reputation
+    /// aggregates against this (stable across redeployments), NOT the
+    /// per-company deployment.
+    pub agent: Pubkey,
+    /// Deployment PDA active when the work was produced (company context).
+    pub deployment: Pubkey,
+    /// Link to the deliverable (article URL, PR, etc). Off-chain pointer.
+    #[max_len(200)]
+    pub result_uri: String,
+    /// SHA-256 of the deliverable content at completion — tamper-evidence
+    /// for the result behind `result_uri`.
+    pub content_hash: [u8; 32],
+    /// Verification verdict. Always `TRACE_VERDICT_PASSED` — only passed
+    /// deliverables are anchored.
+    pub verdict: u8,
+    /// Rubric quality score 0-100 (see `MAX_QUALITY_SCORE`). Tamper-evident
+    /// quality signal, produced by the deterministic gate, not the agent.
+    pub quality_score: u8,
+    /// Version of the scoring rubric that produced `quality_score`. Scores
+    /// are only comparable within the same rubric version.
+    pub rubric_version: u8,
+    /// SHA-256 of the off-chain verification report (claims checked +
+    /// sources). Lets anyone audit WHY the verdict/score was assigned.
+    pub evidence_hash: [u8; 32],
+    /// Unix timestamp the deliverable was completed off-chain.
+    pub completed_at: i64,
+    /// Unix timestamp this commit landed on-chain.
+    pub committed_at: i64,
+    /// Anchor Wallet pubkey that signed the commit. Mirror of
+    /// `OperationsAccount[Anchor].signer` at commit time.
+    pub committed_by: Pubkey,
+    /// Bump for PDA verification.
+    pub bump: u8,
+}
+
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 #[error_code]
@@ -876,4 +1088,10 @@ pub enum RegistryError {
     DiscriminatorNotWhitelisted,
     #[msg("could not parse instruction discriminator")]
     InvalidDiscriminator,
+    #[msg("result_uri exceeds MAX_RESULT_URI_LEN")]
+    ResultUriTooLong,
+    #[msg("quality_score exceeds MAX_QUALITY_SCORE (0-100)")]
+    InvalidQualityScore,
+    #[msg("completed_at must be > 0 and not in the future")]
+    InvalidCompletedAt,
 }
