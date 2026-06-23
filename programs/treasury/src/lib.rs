@@ -30,6 +30,10 @@
 // re-buildable from chain alone. See `occa/CLAUDE.md` "Chain = truth, DB = cache".
 
 use anchor_lang::prelude::*;
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token::{transfer_checked, Mint, Token, TokenAccount, TransferChecked},
+};
 
 declare_id!("occaxyVLnurdjedWCBPrvDCCto8wGYadtTZ3nAmcVzh");
 
@@ -488,6 +492,136 @@ pub mod treasury {
         Ok(())
     }
 
+    /// Routine-class disbursement of an SPL token (e.g. USDC) to an agent's
+    /// receiving address. SPL sibling of `disburse_routine` — identical
+    /// authorization, budget, fee, rate-limit and rollover semantics; only the
+    /// value-movement leg differs (SPL `transfer_checked` CPI instead of direct
+    /// lamport manipulation).
+    ///
+    /// Custody model: the treasury PDA owns its own Associated Token Account
+    /// (`treasury_token_account`) per accepted mint; that ATA is the source of
+    /// funds. The net `amount` goes to the agent's destination ATA (derived
+    /// from `Deployment.receiving_address` + mint — the receiving_address stays
+    /// the wallet), the `fee` goes to the ProtocolFeeAccount's ATA. Both
+    /// recipient ATAs are created if missing (operator pays rent once per
+    /// agent/mint) so a payout never hard-fails on a missing ATA.
+    ///
+    /// The treasury PDA signs the transfers via its seeds
+    /// (`["treasury", company]`), so OCCA/operator never holds the source
+    /// authority key — the same on-chain-policy-bounded model as the SOL path.
+    ///
+    /// `mint` must be a real SPL mint (not `SOL_PSEUDO_MINT`) and must equal
+    /// the passed `mint` account; use `disburse_routine` for native SOL.
+    pub fn disburse_routine_spl(
+        ctx: Context<DisburseRoutineSpl>,
+        mint: Pubkey,
+        amount: u64,
+    ) -> Result<()> {
+        require!(amount > 0, TreasuryError::ZeroAmount);
+        require!(mint != SOL_PSEUDO_MINT, TreasuryError::WrongAssetClass);
+        require!(
+            ctx.accounts.mint.key() == mint,
+            TreasuryError::MintAccountMismatch
+        );
+        require!(
+            ctx.accounts.treasury.accepted_assets.contains(&mint),
+            TreasuryError::AssetNotAllowListed
+        );
+
+        // Verify destination via Deployment (same as SOL path).
+        let dep = read_deployment(&ctx.accounts.deployment)?;
+        require!(
+            dep.company == ctx.accounts.company.key(),
+            TreasuryError::DeploymentCompanyMismatch
+        );
+        require!(
+            dep.receiving_address != Pubkey::default(),
+            TreasuryError::ReceivingAddressUnset
+        );
+        require!(
+            dep.receiving_address == ctx.accounts.destination.key(),
+            TreasuryError::DestinationMismatch
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        let ops = &mut ctx.accounts.operations;
+
+        require!(!ops.revoked, TreasuryError::OperationsRevoked);
+        if ops.expiry_unix != 0 {
+            require!(now < ops.expiry_unix, TreasuryError::OperationsExpired);
+        }
+
+        // Whitelist check — this ix's own discriminator must be allowed. A
+        // Disbursement ops key authorizes SOL and SPL routine payouts
+        // independently: the operator adds each discriminator it wants enabled.
+        let disc_slice: &[u8] = crate::instruction::DisburseRoutineSpl::DISCRIMINATOR;
+        let disc_arr: [u8; 8] = disc_slice
+            .try_into()
+            .map_err(|_| error!(TreasuryError::InvalidProgramData))?;
+        require!(
+            ops.action_whitelist.iter().any(|d| *d == disc_arr),
+            TreasuryError::DiscriminatorNotWhitelisted
+        );
+
+        // Lazy rollover.
+        rollover_operations_period(ops, now);
+        let policy = &mut ctx.accounts.policy;
+        rollover_policy_period(policy, now);
+
+        // Rate limit.
+        require!(
+            ops.signatures_this_period < ops.rate_limit_per_period,
+            TreasuryError::RateLimitExceeded
+        );
+
+        // Fee + budget (per-mint, base units — identical accounting to SOL).
+        let (fee, gross) = compute_fee(amount, policy.agent_operating_fee_bps)?;
+        let routine_budget = get_asset_amount(&policy.routine_budget_per_month, mint);
+        apply_spent(
+            &mut policy.routine_spent_this_period,
+            routine_budget,
+            mint,
+            gross,
+        )?;
+
+        // Token movement — treasury PDA signs both legs via its seeds.
+        let company_key = ctx.accounts.company.key();
+        treasury_spl_transfer(
+            &ctx.accounts.token_program,
+            &ctx.accounts.treasury_token_account,
+            &ctx.accounts.destination_token_account,
+            &ctx.accounts.mint,
+            &ctx.accounts.treasury,
+            &company_key,
+            amount,
+        )?;
+        if fee > 0 {
+            treasury_spl_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.treasury_token_account,
+                &ctx.accounts.fee_token_account,
+                &ctx.accounts.mint,
+                &ctx.accounts.treasury,
+                &company_key,
+                fee,
+            )?;
+            upsert_asset_amount(
+                &mut ctx.accounts.protocol_fee_account.balances,
+                mint,
+                fee,
+            )?;
+        }
+
+        // Increment ops counter (after all fallible ops succeeded).
+        let ops = &mut ctx.accounts.operations;
+        ops.signatures_this_period = ops
+            .signatures_this_period
+            .checked_add(1)
+            .ok_or(TreasuryError::ArithmeticOverflow)?;
+
+        Ok(())
+    }
+
     /// Discretionary-class disbursement to an agent's receiving address.
     /// Signed by controlling authority (= company.owner). Used for ad-hoc
     /// agent payouts outside of recurring routine flow.
@@ -549,6 +683,92 @@ pub mod treasury {
         credit_lamports(&dest_info, amount)?;
         if fee > 0 {
             credit_lamports(&fee_info, fee)?;
+            upsert_asset_amount(
+                &mut ctx.accounts.protocol_fee_account.balances,
+                mint,
+                fee,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Discretionary-class disbursement of an SPL token to an agent's receiving
+    /// address. SPL sibling of `disburse_discretionary` — signed by controlling
+    /// authority, no operations account / rate limit / whitelist, budget drawn
+    /// from `discretionary_*` counters, fee always applies. Only the value-
+    /// movement leg differs (SPL `transfer_checked` CPI). See
+    /// `disburse_routine_spl` for the custody / ATA model.
+    pub fn disburse_discretionary_spl(
+        ctx: Context<DisburseDiscretionarySpl>,
+        mint: Pubkey,
+        amount: u64,
+    ) -> Result<()> {
+        let company_owner = read_company_owner(&ctx.accounts.company)?;
+        require!(
+            ctx.accounts.controlling_authority.key() == company_owner,
+            TreasuryError::UnauthorizedSigner
+        );
+
+        require!(amount > 0, TreasuryError::ZeroAmount);
+        require!(mint != SOL_PSEUDO_MINT, TreasuryError::WrongAssetClass);
+        require!(
+            ctx.accounts.mint.key() == mint,
+            TreasuryError::MintAccountMismatch
+        );
+        require!(
+            ctx.accounts.treasury.accepted_assets.contains(&mint),
+            TreasuryError::AssetNotAllowListed
+        );
+
+        let dep = read_deployment(&ctx.accounts.deployment)?;
+        require!(
+            dep.company == ctx.accounts.company.key(),
+            TreasuryError::DeploymentCompanyMismatch
+        );
+        require!(
+            dep.receiving_address != Pubkey::default(),
+            TreasuryError::ReceivingAddressUnset
+        );
+        require!(
+            dep.receiving_address == ctx.accounts.destination.key(),
+            TreasuryError::DestinationMismatch
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        let policy = &mut ctx.accounts.policy;
+        rollover_policy_period(policy, now);
+
+        let (fee, gross) = compute_fee(amount, policy.agent_operating_fee_bps)?;
+        let discretionary_budget =
+            get_asset_amount(&policy.discretionary_budget_per_month, mint);
+        apply_spent(
+            &mut policy.discretionary_spent_this_period,
+            discretionary_budget,
+            mint,
+            gross,
+        )?;
+
+        let company_key = ctx.accounts.company.key();
+        treasury_spl_transfer(
+            &ctx.accounts.token_program,
+            &ctx.accounts.treasury_token_account,
+            &ctx.accounts.destination_token_account,
+            &ctx.accounts.mint,
+            &ctx.accounts.treasury,
+            &company_key,
+            amount,
+        )?;
+        if fee > 0 {
+            treasury_spl_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.treasury_token_account,
+                &ctx.accounts.fee_token_account,
+                &ctx.accounts.mint,
+                &ctx.accounts.treasury,
+                &company_key,
+                fee,
+            )?;
             upsert_asset_amount(
                 &mut ctx.accounts.protocol_fee_account.balances,
                 mint,
@@ -657,6 +877,120 @@ pub mod treasury {
         Ok(())
     }
 
+    /// Privileged-class SPL disbursement. SPL sibling of `disburse_privileged`.
+    /// Destination unrestricted: agent receiving address (fee applies) or any
+    /// external wallet (no fee). Signed by controlling authority; above the
+    /// per-mint `privileged_threshold_per_token` entry (if configured) the
+    /// registered secondary signer is also required. No budget check
+    /// (privileged class is unbudgeted by design).
+    ///
+    /// `is_agent_destination = true` ⇒ caller MUST pass the agent's
+    /// `Deployment`; destination must equal `deployment.receiving_address` and
+    /// the fee is deducted. `false` ⇒ `deployment` omitted, no fee. Tokens land
+    /// in `destination`'s ATA either way.
+    pub fn disburse_privileged_spl(
+        ctx: Context<DisbursePrivilegedSpl>,
+        mint: Pubkey,
+        amount: u64,
+        is_agent_destination: bool,
+    ) -> Result<()> {
+        let company_owner = read_company_owner(&ctx.accounts.company)?;
+        require!(
+            ctx.accounts.controlling_authority.key() == company_owner,
+            TreasuryError::UnauthorizedSigner
+        );
+
+        require!(amount > 0, TreasuryError::ZeroAmount);
+        require!(mint != SOL_PSEUDO_MINT, TreasuryError::WrongAssetClass);
+        require!(
+            ctx.accounts.mint.key() == mint,
+            TreasuryError::MintAccountMismatch
+        );
+        require!(
+            ctx.accounts.treasury.accepted_assets.contains(&mint),
+            TreasuryError::AssetNotAllowListed
+        );
+
+        let policy = &ctx.accounts.policy;
+
+        // Above per-mint threshold ⇒ secondary signer required. No configured
+        // entry for this mint ⇒ no threshold ⇒ never trips (see
+        // `get_asset_threshold`).
+        if let Some(threshold) =
+            get_asset_threshold(&policy.privileged_threshold_per_token, mint)
+        {
+            if amount > threshold {
+                let registered = policy
+                    .secondary_signer
+                    .ok_or(TreasuryError::SecondarySignerRequired)?;
+                let provided = ctx
+                    .accounts
+                    .secondary_signer
+                    .as_ref()
+                    .ok_or(TreasuryError::SecondarySignerRequired)?;
+                require!(
+                    provided.key() == registered,
+                    TreasuryError::SecondarySignerMismatch
+                );
+            }
+        }
+
+        // Fee path — only if destination is intra-company agent.
+        let fee = if is_agent_destination {
+            let dep_acc = ctx
+                .accounts
+                .deployment
+                .as_ref()
+                .ok_or(TreasuryError::MissingDeploymentForAgentDestination)?;
+            let dep = read_deployment(dep_acc)?;
+            require!(
+                dep.company == ctx.accounts.company.key(),
+                TreasuryError::DeploymentCompanyMismatch
+            );
+            require!(
+                dep.receiving_address != Pubkey::default(),
+                TreasuryError::ReceivingAddressUnset
+            );
+            require!(
+                dep.receiving_address == ctx.accounts.destination.key(),
+                TreasuryError::DestinationMismatch
+            );
+            let (fee, _gross) = compute_fee(amount, policy.agent_operating_fee_bps)?;
+            fee
+        } else {
+            0
+        };
+
+        let company_key = ctx.accounts.company.key();
+        treasury_spl_transfer(
+            &ctx.accounts.token_program,
+            &ctx.accounts.treasury_token_account,
+            &ctx.accounts.destination_token_account,
+            &ctx.accounts.mint,
+            &ctx.accounts.treasury,
+            &company_key,
+            amount,
+        )?;
+        if fee > 0 {
+            treasury_spl_transfer(
+                &ctx.accounts.token_program,
+                &ctx.accounts.treasury_token_account,
+                &ctx.accounts.fee_token_account,
+                &ctx.accounts.mint,
+                &ctx.accounts.treasury,
+                &company_key,
+                fee,
+            )?;
+            upsert_asset_amount(
+                &mut ctx.accounts.protocol_fee_account.balances,
+                mint,
+                fee,
+            )?;
+        }
+
+        Ok(())
+    }
+
     // ───────────────────── Protocol fee withdrawal ──────────────────────────
 
     /// Withdraw accumulated protocol fees from the singleton
@@ -696,6 +1030,51 @@ pub mod treasury {
         let dest_info = ctx.accounts.destination.to_account_info();
         debit_pda_lamports(&fee_info, amount)?;
         credit_lamports(&dest_info, amount)?;
+
+        Ok(())
+    }
+
+    /// Withdraw accumulated SPL protocol fees from the singleton
+    /// `ProtocolFeeAccount`'s ATA to a governance-chosen destination ATA. SPL
+    /// sibling of `withdraw_protocol_fees`. Signed by `governance`; the
+    /// withdrawn `amount` is decremented from the tracked per-mint `balances`
+    /// (accounting truth — cannot withdraw more than was accumulated) and moved
+    /// via a `transfer_checked` CPI signed by the ProtocolFeeAccount PDA. The
+    /// destination ATA is created if missing (governance pays rent). Partial
+    /// withdrawals allowed.
+    pub fn withdraw_protocol_fees_spl(
+        ctx: Context<WithdrawProtocolFeesSpl>,
+        mint: Pubkey,
+        amount: u64,
+    ) -> Result<()> {
+        require!(amount > 0, TreasuryError::ZeroAmount);
+        require!(mint != SOL_PSEUDO_MINT, TreasuryError::WrongAssetClass);
+        require!(
+            ctx.accounts.mint.key() == mint,
+            TreasuryError::MintAccountMismatch
+        );
+
+        // Decrement tracked balance first (accounting truth). Rejects if the
+        // mint was never accumulated or the request exceeds what is owed.
+        decrement_asset_amount(
+            &mut ctx.accounts.protocol_fee_account.balances,
+            mint,
+            amount,
+        )?;
+
+        // Token movement — ProtocolFeeAccount PDA signs via its seeds.
+        let bump = [ctx.accounts.protocol_fee_account.bump];
+        let seeds: &[&[u8]] = &[b"protocol_fees", &bump];
+        let signer: &[&[&[u8]]] = &[seeds];
+        spl_transfer_signed(
+            &ctx.accounts.token_program,
+            &ctx.accounts.fee_token_account,
+            &ctx.accounts.destination_token_account,
+            &ctx.accounts.mint,
+            ctx.accounts.protocol_fee_account.to_account_info(),
+            signer,
+            amount,
+        )?;
 
         Ok(())
     }
@@ -955,6 +1334,101 @@ pub struct DisburseRoutine<'info> {
 }
 
 #[derive(Accounts)]
+pub struct DisburseRoutineSpl<'info> {
+    /// CHECK: ownership-program match.
+    #[account(owner = REGISTRY_PROGRAM_ID @ TreasuryError::CompanyOwnerMismatch)]
+    pub company: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"treasury", company.key().as_ref()],
+        bump = treasury.bump,
+        constraint = treasury.company == company.key() @ TreasuryError::PolicyMismatch,
+    )]
+    pub treasury: Account<'info, TreasuryAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"policy", company.key().as_ref()],
+        bump = policy.bump,
+        constraint = policy.company == company.key() @ TreasuryError::PolicyMismatch,
+    )]
+    pub policy: Account<'info, PolicyAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"operations", company.key().as_ref(), &[OperationsKind::Disbursement.as_byte()]],
+        bump = operations.bump,
+        constraint = operations.company == company.key() @ TreasuryError::PolicyMismatch,
+        constraint = operations.kind == OperationsKind::Disbursement @ TreasuryError::WrongOperationsKind,
+        constraint = operations.signer == operations_signer.key() @ TreasuryError::UnauthorizedSigner,
+    )]
+    pub operations: Account<'info, OperationsAccount>,
+
+    /// Disbursement Wallet — operator-held only. Also pays rent for any
+    /// destination/fee ATA created on demand (create-if-needed).
+    #[account(mut)]
+    pub operations_signer: Signer<'info>,
+
+    /// Registry-owned Deployment whose `receiving_address` must equal
+    /// `destination.key()`. Field decoding done in handler.
+    /// CHECK: ownership-program match; field-level checks in handler.
+    #[account(owner = REGISTRY_PROGRAM_ID @ TreasuryError::CompanyOwnerMismatch)]
+    pub deployment: UncheckedAccount<'info>,
+
+    /// Agent receiving wallet — owner of `destination_token_account`. Matched
+    /// against `deployment.receiving_address` in handler. The wallet itself is
+    /// not touched; tokens land in its ATA.
+    /// CHECK: matched against `deployment.receiving_address` in handler.
+    pub destination: UncheckedAccount<'info>,
+
+    /// SPL mint being disbursed (e.g. USDC). Must equal the `mint` argument
+    /// and be in `treasury.accepted_assets`.
+    pub mint: Box<Account<'info, Mint>>,
+
+    /// Treasury PDA's ATA for `mint` — the source of funds. Must already exist
+    /// and hold ≥ gross; treasury is funded out-of-band by sending tokens here.
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = treasury,
+    )]
+    pub treasury_token_account: Box<Account<'info, TokenAccount>>,
+
+    /// Agent's destination ATA for `mint`. Created if missing (operator pays
+    /// rent ~0.002 SOL once per agent/mint) so payout never fails on a missing
+    /// ATA.
+    #[account(
+        init_if_needed,
+        payer = operations_signer,
+        associated_token::mint = mint,
+        associated_token::authority = destination,
+    )]
+    pub destination_token_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [b"protocol_fees"],
+        bump = protocol_fee_account.bump,
+    )]
+    pub protocol_fee_account: Account<'info, ProtocolFeeAccount>,
+
+    /// ProtocolFeeAccount PDA's ATA for `mint` — fee destination. Created if
+    /// missing (first fee accrued in this mint).
+    #[account(
+        init_if_needed,
+        payer = operations_signer,
+        associated_token::mint = mint,
+        associated_token::authority = protocol_fee_account,
+    )]
+    pub fee_token_account: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct DisburseDiscretionary<'info> {
     /// CHECK: ownership-program match.
     #[account(owner = REGISTRY_PROGRAM_ID @ TreasuryError::CompanyOwnerMismatch)]
@@ -992,6 +1466,78 @@ pub struct DisburseDiscretionary<'info> {
         bump = protocol_fee_account.bump,
     )]
     pub protocol_fee_account: Account<'info, ProtocolFeeAccount>,
+}
+
+#[derive(Accounts)]
+pub struct DisburseDiscretionarySpl<'info> {
+    /// CHECK: ownership-program match.
+    #[account(owner = REGISTRY_PROGRAM_ID @ TreasuryError::CompanyOwnerMismatch)]
+    pub company: UncheckedAccount<'info>,
+
+    /// Controlling Authority — must equal `CompanyAccount.owner`. Also pays
+    /// rent for any destination/fee ATA created on demand.
+    #[account(mut)]
+    pub controlling_authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"treasury", company.key().as_ref()],
+        bump = treasury.bump,
+        constraint = treasury.company == company.key() @ TreasuryError::PolicyMismatch,
+    )]
+    pub treasury: Account<'info, TreasuryAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"policy", company.key().as_ref()],
+        bump = policy.bump,
+        constraint = policy.company == company.key() @ TreasuryError::PolicyMismatch,
+    )]
+    pub policy: Account<'info, PolicyAccount>,
+
+    /// CHECK: ownership-program match; field-level checks in handler.
+    #[account(owner = REGISTRY_PROGRAM_ID @ TreasuryError::CompanyOwnerMismatch)]
+    pub deployment: UncheckedAccount<'info>,
+
+    /// Agent receiving wallet — owner of `destination_token_account`.
+    /// CHECK: matched against `deployment.receiving_address` in handler.
+    pub destination: UncheckedAccount<'info>,
+
+    pub mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = treasury,
+    )]
+    pub treasury_token_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init_if_needed,
+        payer = controlling_authority,
+        associated_token::mint = mint,
+        associated_token::authority = destination,
+    )]
+    pub destination_token_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [b"protocol_fees"],
+        bump = protocol_fee_account.bump,
+    )]
+    pub protocol_fee_account: Account<'info, ProtocolFeeAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = controlling_authority,
+        associated_token::mint = mint,
+        associated_token::authority = protocol_fee_account,
+    )]
+    pub fee_token_account: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -1042,6 +1588,85 @@ pub struct DisbursePrivileged<'info> {
 }
 
 #[derive(Accounts)]
+pub struct DisbursePrivilegedSpl<'info> {
+    /// CHECK: ownership-program match.
+    #[account(owner = REGISTRY_PROGRAM_ID @ TreasuryError::CompanyOwnerMismatch)]
+    pub company: UncheckedAccount<'info>,
+
+    /// Controlling Authority — must equal `CompanyAccount.owner`. Also pays
+    /// rent for any destination/fee ATA created on demand.
+    #[account(mut)]
+    pub controlling_authority: Signer<'info>,
+
+    /// Required only when `amount` exceeds the per-mint
+    /// `privileged_threshold_per_token` entry. Pubkey verified against
+    /// `policy.secondary_signer` in handler.
+    pub secondary_signer: Option<Signer<'info>>,
+
+    #[account(
+        mut,
+        seeds = [b"treasury", company.key().as_ref()],
+        bump = treasury.bump,
+        constraint = treasury.company == company.key() @ TreasuryError::PolicyMismatch,
+    )]
+    pub treasury: Account<'info, TreasuryAccount>,
+
+    #[account(
+        seeds = [b"policy", company.key().as_ref()],
+        bump = policy.bump,
+        constraint = policy.company == company.key() @ TreasuryError::PolicyMismatch,
+    )]
+    pub policy: Account<'info, PolicyAccount>,
+
+    /// Pass `Some(deployment)` when `is_agent_destination = true`, else `None`.
+    /// CHECK: ownership-program match; field-level checks in handler.
+    #[account(owner = REGISTRY_PROGRAM_ID @ TreasuryError::CompanyOwnerMismatch)]
+    pub deployment: Option<UncheckedAccount<'info>>,
+
+    /// Destination wallet — owner of `destination_token_account`. Unrestricted
+    /// (privileged). Verified against `deployment.receiving_address` only when
+    /// `is_agent_destination = true`.
+    /// CHECK: see above.
+    pub destination: UncheckedAccount<'info>,
+
+    pub mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = treasury,
+    )]
+    pub treasury_token_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init_if_needed,
+        payer = controlling_authority,
+        associated_token::mint = mint,
+        associated_token::authority = destination,
+    )]
+    pub destination_token_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [b"protocol_fees"],
+        bump = protocol_fee_account.bump,
+    )]
+    pub protocol_fee_account: Account<'info, ProtocolFeeAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = controlling_authority,
+        associated_token::mint = mint,
+        associated_token::authority = protocol_fee_account,
+    )]
+    pub fee_token_account: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct WithdrawProtocolFees<'info> {
     #[account(
         mut,
@@ -1059,6 +1684,50 @@ pub struct WithdrawProtocolFees<'info> {
     /// CHECK: unrestricted destination authorized by the governance signature.
     #[account(mut)]
     pub destination: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawProtocolFeesSpl<'info> {
+    #[account(
+        mut,
+        seeds = [b"protocol_fees"],
+        bump = protocol_fee_account.bump,
+        constraint = protocol_fee_account.governance == governance.key() @ TreasuryError::UnauthorizedSigner,
+    )]
+    pub protocol_fee_account: Account<'info, ProtocolFeeAccount>,
+
+    /// Governance withdrawal authority pinned at init. Must sign; also pays
+    /// rent if the destination ATA is created on demand.
+    #[account(mut)]
+    pub governance: Signer<'info>,
+
+    /// Destination wallet — owner of `destination_token_account`. Governance
+    /// picks freely (DAO treasury, multisig, etc.).
+    /// CHECK: authorized by the governance signature.
+    pub destination: UncheckedAccount<'info>,
+
+    pub mint: Box<Account<'info, Mint>>,
+
+    /// ProtocolFeeAccount PDA's ATA for `mint` — the source of withdrawn fees.
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = protocol_fee_account,
+    )]
+    pub fee_token_account: Box<Account<'info, TokenAccount>>,
+
+    /// Destination ATA — created if missing (governance pays rent).
+    #[account(
+        init_if_needed,
+        payer = governance,
+        associated_token::mint = mint,
+        associated_token::authority = destination,
+    )]
+    pub destination_token_account: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -1368,6 +2037,15 @@ fn get_asset_amount(vec: &[AssetBudget], mint: Pubkey) -> u64 {
         .unwrap_or(0)
 }
 
+/// Per-mint privileged threshold lookup. Returns `None` when `mint` has no
+/// configured entry — meaning "no threshold", so no secondary signer is
+/// required (parallel to SOL's `privileged_threshold_lamports` default of
+/// `u64::MAX`). Distinct from `get_asset_amount`, whose `0`-on-absent default
+/// would wrongly trip the secondary-signer requirement on every disbursement.
+fn get_asset_threshold(vec: &[AssetBudget], mint: Pubkey) -> Option<u64> {
+    vec.iter().find(|e| e.mint == mint).map(|e| e.amount)
+}
+
 fn upsert_asset_amount(
     vec: &mut Vec<AssetBudget>,
     mint: Pubkey,
@@ -1455,6 +2133,61 @@ fn credit_lamports<'info>(target: &AccountInfo<'info>, amount: u64) -> Result<()
         .ok_or(TreasuryError::ArithmeticOverflow)?;
     **target.try_borrow_mut_lamports()? = new_bal;
     Ok(())
+}
+
+/// Core SPL `transfer_checked` CPI signed by a program-derived `authority` via
+/// `signer_seeds`. `transfer_checked` re-validates the mint + decimals on-chain,
+/// rejecting a wrong-mint token account. Authority varies by caller: the
+/// treasury PDA for `disburse_*_spl`, the ProtocolFeeAccount PDA for
+/// `withdraw_protocol_fees_spl`.
+fn spl_transfer_signed<'info>(
+    token_program: &Program<'info, Token>,
+    from: &Account<'info, TokenAccount>,
+    to: &Account<'info, TokenAccount>,
+    mint: &Account<'info, Mint>,
+    authority: AccountInfo<'info>,
+    signer_seeds: &[&[&[u8]]],
+    amount: u64,
+) -> Result<()> {
+    let cpi = CpiContext::new_with_signer(
+        token_program.key(),
+        TransferChecked {
+            from: from.to_account_info(),
+            mint: mint.to_account_info(),
+            to: to.to_account_info(),
+            authority,
+        },
+        signer_seeds,
+    );
+    transfer_checked(cpi, amount, mint.decimals)
+}
+
+/// Move SPL tokens out of the treasury PDA's ATA, signed by the treasury PDA
+/// through its seeds (`["treasury", company]`), so OCCA/operator never holds
+/// the source-token authority key. The `disburse_*_spl` handlers route both the
+/// net amount (to the agent ATA) and the fee (to the ProtocolFeeAccount ATA)
+/// through here.
+fn treasury_spl_transfer<'info>(
+    token_program: &Program<'info, Token>,
+    from: &Account<'info, TokenAccount>,
+    to: &Account<'info, TokenAccount>,
+    mint: &Account<'info, Mint>,
+    treasury: &Account<'info, TreasuryAccount>,
+    company_key: &Pubkey,
+    amount: u64,
+) -> Result<()> {
+    let bump = [treasury.bump];
+    let seeds: &[&[u8]] = &[b"treasury", company_key.as_ref(), &bump];
+    let signer: &[&[&[u8]]] = &[seeds];
+    spl_transfer_signed(
+        token_program,
+        from,
+        to,
+        mint,
+        treasury.to_account_info(),
+        signer,
+        amount,
+    )
 }
 
 // ─── Calendar arithmetic (§5) ──────────────────────────────────────────────
@@ -1602,6 +2335,10 @@ pub enum TreasuryError {
     InsufficientFeeBalance,
     #[msg("new governance authority cannot be the default pubkey")]
     InvalidGovernance,
+    #[msg("wrong asset class for this instruction (SPL ix requires a real mint; use the SOL variant for native SOL)")]
+    WrongAssetClass,
+    #[msg("mint account does not match the mint argument")]
+    MintAccountMismatch,
 }
 
 // ─── Unit tests ────────────────────────────────────────────────────────────

@@ -14,7 +14,17 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 default = []
-idl-build = ["anchor-lang/idl-build"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]
-anchor-lang = "1.0.2"
+# `init-if-needed` is required for the create-if-needed destination/fee ATAs
+# in the `disburse_*_spl` handlers (multi-asset USDC). Safe here: every
+# init_if_needed target is an Associated Token Account whose address is
+# deterministic and whose owner/mint Anchor re-verifies, so the classic
+# re-initialization foot-gun does not apply.
+anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
+# Only the legacy SPL Token + Associated Token machinery is used (USDC is a
+# classic SPL Token mint, not Token-2022). Dropping anchor-spl's default
+# features cuts the unused token_2022 / token_2022_extensions / metadata code
+# from the binary.
+anchor-spl = { version = "1.0.2", default-features = false, features = ["token", "associated_token"] }
