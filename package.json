@@ -11,13 +11,15 @@
     "disburse-routine": "ts-node tests/disburse-routine.ts",
     "disburse-routine-fails": "ts-node tests/disburse-routine-fails.ts",
     "disburse-privileged": "ts-node tests/disburse-privileged.ts",
-    "anchor-task": "ts-node tests/anchor-existing-task.ts"
+    "anchor-task": "ts-node tests/anchor-existing-task.ts",
+    "disburse-spl": "ts-node tests/disburse-spl.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.0",
     "@solana/web3.js": "^1.95.0"
   },
   "devDependencies": {
+    "@solana/spl-token": "^0.4.14",
     "@types/node": "^20.11.0",
     "ts-node": "^10.9.0",
     "typescript": "^5.4.0"
