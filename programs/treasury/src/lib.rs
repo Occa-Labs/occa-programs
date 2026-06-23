@@ -37,6 +37,15 @@ declare_id!("occaxyVLnurdjedWCBPrvDCCto8wGYadtTZ3nAmcVzh");
 /// is genuinely owned by the Registry program (not a forgery).
 const REGISTRY_PROGRAM_ID: Pubkey = pubkey!("occaTHMv5eYG5aZ85jimxTvHkBfsDCvndXC6J2k8kxr");
 
+/// Anchor account discriminators (`sha256("account:<Name>")[..8]`) for the
+/// Registry account types this program reads cross-program. Checked in the
+/// `read_*` helpers so a Registry-owned account of the WRONG type is rejected
+/// instead of silently misread: `AgentIdentity` and `Deployment` share the
+/// same `version` byte (2), so the version check alone cannot tell them apart
+/// — only the discriminator can. Must match registry's generated IDL.
+const COMPANY_ACCOUNT_DISCRIMINATOR: [u8; 8] = [37, 215, 171, 200, 8, 141, 69, 96];
+const DEPLOYMENT_DISCRIMINATOR: [u8; 8] = [66, 90, 104, 89, 183, 130, 64, 178];
+
 /// Registry's `CompanyAccount` schema version this program is built against.
 /// Layout assumed by `read_company_owner`:
 ///   `[8B disc][1B version][32B owner][...]`
@@ -459,7 +468,7 @@ pub mod treasury {
         let dest_info = ctx.accounts.destination.to_account_info();
         let fee_info = ctx.accounts.protocol_fee_account.to_account_info();
 
-        debit_treasury_lamports(&treasury_info, gross)?;
+        debit_pda_lamports(&treasury_info, gross)?;
         credit_lamports(&dest_info, amount)?;
         if fee > 0 {
             credit_lamports(&fee_info, fee)?;
@@ -536,7 +545,7 @@ pub mod treasury {
         let dest_info = ctx.accounts.destination.to_account_info();
         let fee_info = ctx.accounts.protocol_fee_account.to_account_info();
 
-        debit_treasury_lamports(&treasury_info, gross)?;
+        debit_pda_lamports(&treasury_info, gross)?;
         credit_lamports(&dest_info, amount)?;
         if fee > 0 {
             credit_lamports(&fee_info, fee)?;
@@ -634,7 +643,7 @@ pub mod treasury {
         let dest_info = ctx.accounts.destination.to_account_info();
         let fee_info = ctx.accounts.protocol_fee_account.to_account_info();
 
-        debit_treasury_lamports(&treasury_info, gross)?;
+        debit_pda_lamports(&treasury_info, gross)?;
         credit_lamports(&dest_info, amount)?;
         if fee > 0 {
             credit_lamports(&fee_info, fee)?;
@@ -645,6 +654,71 @@ pub mod treasury {
             )?;
         }
 
+        Ok(())
+    }
+
+    // ───────────────────── Protocol fee withdrawal ──────────────────────────
+
+    /// Withdraw accumulated protocol fees from the singleton
+    /// `ProtocolFeeAccount` to a governance-chosen destination. Without this
+    /// instruction, fees credited by the `disburse_*` handlers would be
+    /// write-only — permanently locked on the PDA.
+    ///
+    /// Authorization: signed by the `governance` authority pinned at
+    /// `init_protocol_fee_account` (e.g. a DAO / multisig key), distinct from
+    /// the program's upgrade authority.
+    ///
+    /// Phase 1: SOL only (`mint == SOL_PSEUDO_MINT`), matching the
+    /// disbursement path. The withdrawn `amount` is decremented from the
+    /// tracked per-asset `balances` entry (accounting truth — cannot withdraw
+    /// more than was accumulated) and the PDA's rent-exempt minimum is
+    /// protected so the runtime never GCs the account. Partial withdrawals
+    /// are allowed.
+    pub fn withdraw_protocol_fees(
+        ctx: Context<WithdrawProtocolFees>,
+        mint: Pubkey,
+        amount: u64,
+    ) -> Result<()> {
+        require!(amount > 0, TreasuryError::ZeroAmount);
+        require!(mint == SOL_PSEUDO_MINT, TreasuryError::SplNotSupported);
+
+        // Decrement tracked balance first (accounting truth). Rejects if the
+        // mint was never accumulated or the request exceeds what is owed.
+        decrement_asset_amount(
+            &mut ctx.accounts.protocol_fee_account.balances,
+            mint,
+            amount,
+        )?;
+
+        // Lamport movement — fee account is program-owned, so manipulate
+        // lamports directly (rent-exempt minimum protected).
+        let fee_info = ctx.accounts.protocol_fee_account.to_account_info();
+        let dest_info = ctx.accounts.destination.to_account_info();
+        debit_pda_lamports(&fee_info, amount)?;
+        credit_lamports(&dest_info, amount)?;
+
+        Ok(())
+    }
+
+    /// Rotate the `governance` withdrawal authority to a new key. Signed by
+    /// the CURRENT governance authority — the only way to change `governance`
+    /// after init, which is otherwise immutable.
+    ///
+    /// Defends against permanent fund-lock / key compromise: if the
+    /// governance key is being retired, moved to a multisig, or is feared
+    /// leaked, the current holder rotates to a fresh key here. An attacker
+    /// cannot call this without already holding the current key (which would
+    /// also let them withdraw), so rotation adds no new theft surface — it is
+    /// purely defensive.
+    ///
+    /// `new_governance` cannot be the default pubkey: that would re-lock the
+    /// account with no valid signer.
+    pub fn set_governance(ctx: Context<SetGovernance>, new_governance: Pubkey) -> Result<()> {
+        require!(
+            new_governance != Pubkey::default(),
+            TreasuryError::InvalidGovernance
+        );
+        ctx.accounts.protocol_fee_account.governance = new_governance;
         Ok(())
     }
 }
@@ -967,6 +1041,40 @@ pub struct DisbursePrivileged<'info> {
     pub protocol_fee_account: Account<'info, ProtocolFeeAccount>,
 }
 
+#[derive(Accounts)]
+pub struct WithdrawProtocolFees<'info> {
+    #[account(
+        mut,
+        seeds = [b"protocol_fees"],
+        bump = protocol_fee_account.bump,
+        constraint = protocol_fee_account.governance == governance.key() @ TreasuryError::UnauthorizedSigner,
+    )]
+    pub protocol_fee_account: Account<'info, ProtocolFeeAccount>,
+
+    /// Governance withdrawal authority pinned at init. Must sign.
+    pub governance: Signer<'info>,
+
+    /// Destination for the withdrawn lamports. Governance signs, so it picks
+    /// freely (DAO treasury, multisig, etc.).
+    /// CHECK: unrestricted destination authorized by the governance signature.
+    #[account(mut)]
+    pub destination: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SetGovernance<'info> {
+    #[account(
+        mut,
+        seeds = [b"protocol_fees"],
+        bump = protocol_fee_account.bump,
+        constraint = protocol_fee_account.governance == governance.key() @ TreasuryError::UnauthorizedSigner,
+    )]
+    pub protocol_fee_account: Account<'info, ProtocolFeeAccount>,
+
+    /// Current governance authority. Must sign to rotate.
+    pub governance: Signer<'info>,
+}
+
 // ─── Account schemas ───────────────────────────────────────────────────────
 
 #[account]
@@ -1070,7 +1178,9 @@ pub struct OperationsAccount {
 pub struct ProtocolFeeAccount {
     pub version: u8,
     /// Long-lived withdrawal authority — typically a DAO / multisig key,
-    /// distinct from the program's upgrade authority. Settable only at init.
+    /// distinct from the program's upgrade authority. Set at init, then
+    /// rotatable by the current holder via `set_governance` (guards against
+    /// key loss / compromise). A multisig here survives a single lost key.
     pub governance: Pubkey,
     /// Per-asset accumulated fee balances.
     #[max_len(8)]
@@ -1148,6 +1258,12 @@ fn read_company_owner(company: &UncheckedAccount<'_>) -> Result<Pubkey> {
         data.len() >= COMPANY_OWNER_OFFSET + 32,
         TreasuryError::InvalidCompanyAccount
     );
+    // Discriminator gates the account TYPE (rejects a wrong Registry account);
+    // the version byte below gates the LAYOUT compatibility.
+    require!(
+        data[..8] == COMPANY_ACCOUNT_DISCRIMINATOR,
+        TreasuryError::InvalidCompanyAccount
+    );
     let version = data[8];
     require!(
         version == SUPPORTED_COMPANY_VERSION,
@@ -1193,6 +1309,12 @@ fn read_deployment(deployment: &UncheckedAccount<'_>) -> Result<DeploymentInfo> 
     let data = deployment.try_borrow_data()?;
     require!(
         data.len() >= DEPLOYMENT_RECEIVING_OFFSET + 32,
+        TreasuryError::InvalidDeploymentAccount
+    );
+    // Discriminator gates the account TYPE — without it an AgentIdentity
+    // (same version byte 2) would be accepted here and misread.
+    require!(
+        data[..8] == DEPLOYMENT_DISCRIMINATOR,
         TreasuryError::InvalidDeploymentAccount
     );
     let version = data[8];
@@ -1268,6 +1390,26 @@ fn upsert_asset_amount(
     Ok(())
 }
 
+/// Decrement the tracked balance for `mint` by `delta`. Rejects if the mint
+/// has no entry or the entry is smaller than `delta` — you cannot withdraw
+/// more than was accumulated. Mirror of `upsert_asset_amount` for outflows.
+fn decrement_asset_amount(
+    vec: &mut [AssetBudget],
+    mint: Pubkey,
+    delta: u64,
+) -> Result<()> {
+    for entry in vec.iter_mut() {
+        if entry.mint == mint {
+            entry.amount = entry
+                .amount
+                .checked_sub(delta)
+                .ok_or(TreasuryError::InsufficientFeeBalance)?;
+            return Ok(());
+        }
+    }
+    Err(error!(TreasuryError::InsufficientFeeBalance))
+}
+
 /// Check that `delta` fits inside the per-period budget for `mint`, then
 /// increment the spent counter. Used by disburse_routine and disburse_discretionary.
 /// `budget_amount` is pre-extracted by the caller (`get_asset_amount`) to avoid
@@ -1287,19 +1429,20 @@ fn apply_spent(
     Ok(())
 }
 
-/// Move SOL lamports out of a PDA owned by this program. Treasury PDA must
-/// retain its rent-exempt minimum or the runtime will GC it.
-fn debit_treasury_lamports<'info>(
-    treasury: &AccountInfo<'info>,
+/// Move SOL lamports out of a PDA owned by this program (treasury or protocol
+/// fee account). The PDA must retain its rent-exempt minimum or the runtime
+/// will GC it.
+fn debit_pda_lamports<'info>(
+    pda: &AccountInfo<'info>,
     amount: u64,
 ) -> Result<()> {
-    let rent_exempt = Rent::get()?.minimum_balance(treasury.data_len());
-    let current = treasury.lamports();
+    let rent_exempt = Rent::get()?.minimum_balance(pda.data_len());
+    let current = pda.lamports();
     require!(
         current >= rent_exempt + amount,
         TreasuryError::InsufficientFunds
     );
-    **treasury.try_borrow_mut_lamports()? = current
+    **pda.try_borrow_mut_lamports()? = current
         .checked_sub(amount)
         .ok_or(TreasuryError::ArithmeticOverflow)?;
     Ok(())
@@ -1455,6 +1598,10 @@ pub enum TreasuryError {
     SecondarySignerMismatch,
     #[msg("agent destination flag set but no deployment account provided")]
     MissingDeploymentForAgentDestination,
+    #[msg("protocol fee balance is insufficient for this withdrawal")]
+    InsufficientFeeBalance,
+    #[msg("new governance authority cannot be the default pubkey")]
+    InvalidGovernance,
 }
 
 // ─── Unit tests ────────────────────────────────────────────────────────────
