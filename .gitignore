@@ -20,3 +20,7 @@ yarn.lock
 !.vscode/settings.json
 !.vscode/extensions.json
 .idea
+
+# SSH/TLS private keys — never commit
+*.pem
+*.ppk
